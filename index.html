@@ -254,8 +254,8 @@
   async function login() {
     const verifier = randomString(96);
     const stateParam = randomString(16);
-    sessionStorage.setItem('ts_verifier', verifier);
-    sessionStorage.setItem('ts_state', stateParam);
+    store.set('ts_verifier', verifier);
+    store.set('ts_state', stateParam);
     const challenge = await sha256b64url(verifier);
     const params = new URLSearchParams({
       response_type: 'code',
@@ -288,7 +288,7 @@
     }
     const code = p.get('code');
     if (!code) return;
-    const expected = sessionStorage.getItem('ts_state');
+    const expected = store.get('ts_state');
     if (!expected || expected !== p.get('state')) {
       history.replaceState({}, '', REDIRECT);
       throw new Error('Risposta di accesso non valida. Riprova.');
@@ -298,10 +298,10 @@
       code,
       redirect_uri: REDIRECT,
       client_id: store.get('ts_client_id'),
-      code_verifier: sessionStorage.getItem('ts_verifier')
+      code_verifier: store.get('ts_verifier')
     });
-    sessionStorage.removeItem('ts_verifier');
-    sessionStorage.removeItem('ts_state');
+    store.del('ts_verifier');
+    store.del('ts_state');
     history.replaceState({}, '', REDIRECT);
   }
   async function getToken() {
