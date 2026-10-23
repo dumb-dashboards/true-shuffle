@@ -117,9 +117,14 @@
   .list .empty { padding: 14px; color: var(--ink-soft); }
 
   .row { display: flex; gap: 12px; margin-top: 14px; }
+  .check { display: flex; gap: 10px; align-items: flex-start; margin: 16px 0 0; font-weight: 600; cursor: pointer; }
+  .check input { width: 22px; height: 22px; margin: 1px 0 0; accent-color: var(--cobalt); flex: none; }
+  .check input:disabled + span { opacity: .5; }
+  #fresh-hint { margin: 6px 0 0 32px; font-size: 0.85rem; color: var(--ink-soft); }
+  #fresh-hint button { padding: 0; font-size: inherit; }
   .row > div { flex: 1; }
 
-  #status { min-height: 1.5em; margin: 14px 2px 0; color: #fff; font-weight: 600; }
+  #status { white-space: pre-line; min-height: 1.5em; margin: 14px 2px 0; color: #fff; font-weight: 600; }
   #status.error { background: #fff; color: var(--error); padding: 12px 14px; border-radius: 12px; }
   #status a { color: inherit; }
   .done-link { display: inline-block; margin-top: 8px; color: var(--ink); background: var(--butter); padding: 8px 14px; border-radius: 10px; font-weight: 800; text-decoration: none; }
@@ -184,6 +189,8 @@
           </select>
         </div>
       </div>
+      <label class="check"><input type="checkbox" id="fresh"><span>Dai priorità ai brani che non ti propongo da un po’</span></label>
+      <p id="fresh-hint"><span id="fresh-msg"></span> <button class="btn-link" id="reset-hist" type="button">Azzera cronologia</button></p>
     </section>
 
     <button class="go" id="go" type="button" disabled>
@@ -222,7 +229,7 @@
     del(k) { try { localStorage.removeItem(k); } catch {} }
   };
 
-  const state = { me: null, playlists: [], source: null, busy: false };
+  const state = { me: null, playlists: [], source: null, busy: false, names: {} };
 
   // ---------- Stato / messaggi ----------
   function say(msg, isError = false) {
@@ -375,6 +382,33 @@
     return a;
   }
 
+  // ---------- Cronologia (opzionale) ----------
+  const HIST_KEY = 'ts_hist';
+  const HIST_MAX_AGE = 180 * 24 * 3600 * 1000;
+  function loadHist() { try { return JSON.parse(store.get(HIST_KEY) || '{}'); } catch { return {}; } }
+  function recordHist(uris) {
+    const h = loadHist();
+    const now = Date.now();
+    for (const u of uris) h[u] = now;
+    for (const u of Object.keys(h)) if (now - h[u] > HIST_MAX_AGE) delete h[u];
+    store.set(HIST_KEY, JSON.stringify(h));
+  }
+  // Prima i brani mai proposti, poi quelli proposti meno di recente; poi ordine finale rimescolato
+  function pickFresh(uris, limit) {
+    const h = loadHist();
+    const unseen = shuffle(uris.filter(u => !h[u]));
+    const seen = shuffle(uris.filter(u => h[u])).sort((a, b) => h[a] - h[b]);
+    return shuffle(unseen.concat(seen).slice(0, limit));
+  }
+  function updateFreshUI() {
+    const all = Number($('count').value) === 0;
+    $('fresh').disabled = all;
+    const n = Object.keys(loadHist()).length;
+    $('fresh-msg').textContent = all
+      ? 'Con «Tutti» vengono usati comunque tutti i brani.'
+      : (n ? n + ' brani già proposti.' : 'Nessun brano ancora proposto.');
+  }
+
   // ---------- Dati ----------
   async function loadPlaylists() {
     let url = '/me/playlists?limit=50';
@@ -398,7 +432,7 @@
       let url = '/me/tracks?limit=50';
       while (url) {
         const d = await api(url);
-        for (const it of d.items) { const t = trackOf(it); if (t) uris.add(t.uri); }
+        for (const it of d.items) { const t = trackOf(it); if (t) { uris.add(t.uri); state.names[t.uri] = t.name + (t.artists && t.artists[0] ? ' — ' + t.artists[0].name : ''); } }
         n = uris.size; note();
         url = d.next;
       }
@@ -409,7 +443,7 @@
           `/playlists/${source.id}/items?limit=50&offset=${offset}&additional_types=track`,
           `/playlists/${source.id}/tracks?limit=50&offset=${offset}&additional_types=track`
         ]);
-        for (const it of d.items) { const t = trackOf(it); if (t) uris.add(t.uri); }
+        for (const it of d.items) { const t = trackOf(it); if (t) { uris.add(t.uri); state.names[t.uri] = t.name + (t.artists && t.artists[0] ? ' — ' + t.artists[0].name : ''); } }
         n = uris.size; note();
         if (!d.next) break;
         offset += 50;
@@ -433,19 +467,32 @@
     return target;
   }
 
-  async function play(target) {
+  async function play(target, firstUri) {
     const d = await api('/me/player/devices');
     const devices = (d && d.devices) || [];
-    if (!devices.length) return false;
+    if (!devices.length) return { started: false };
     const dev = devices.find(x => x.is_active) || devices[0];
-    const q = '?device_id=' + encodeURIComponent(dev.id);
+    const did = encodeURIComponent(dev.id);
     // Shuffle di Spotify spento, altrimenti rimescola di nuovo il nostro ordine
-    try { await api('/me/player/shuffle?state=false&device_id=' + encodeURIComponent(dev.id), { method: 'PUT' }); } catch {}
-    await api('/me/player/play' + q, {
+    try { await api('/me/player/shuffle?state=false&device_id=' + did, { method: 'PUT' }); } catch {}
+    await api('/me/player/play?device_id=' + did, {
       method: 'PUT',
       body: { context_uri: 'spotify:playlist:' + target.id, offset: { position: 0 } }
     });
-    return true;
+    // Verifica reale di cosa sta suonando
+    await sleep(1800);
+    let shuffleOn = false, firstOk = true, playing = null;
+    try {
+      const cp = await api('/me/player');
+      if (cp) {
+        shuffleOn = !!cp.shuffle_state;
+        if (cp.item) {
+          playing = cp.item.name;
+          firstOk = cp.item.uri === firstUri;
+        }
+      }
+    } catch {}
+    return { started: true, shuffleOn, firstOk, playing };
   }
 
   // ---------- UI ----------
@@ -497,17 +544,31 @@
       say('Carico i brani…');
       const tracks = await fetchAllTracks(state.source);
       if (!tracks.length) throw new Error('Non ho trovato brani riproducibili in questa sorgente.');
-      let mixed = shuffle(tracks);
       const limit = Number($('count').value);
-      if (limit > 0) mixed = mixed.slice(0, limit);
+      let mixed;
+      if ($('fresh').checked && limit > 0) {
+        mixed = pickFresh(tracks, limit);
+      } else {
+        mixed = shuffle(tracks);
+        if (limit > 0) mixed = mixed.slice(0, limit);
+      }
       say('Mescolo ' + mixed.length + ' brani e scrivo la playlist…');
       const target = await writeTarget(mixed);
+      recordHist(mixed);
+      updateFreshUI();
       const url = (target.external_urls && target.external_urls.spotify) || ('https://open.spotify.com/playlist/' + target.id);
       say('Avvio la riproduzione…');
-      let started = false;
-      try { started = await play(target); } catch (e) { started = false; }
-      if (started) {
-        say('In riproduzione: ' + mixed.length + ' brani in ordine casuale.');
+      let res = { started: false };
+      try { res = await play(target, mixed[0]); } catch (e) { res = { started: false }; }
+      if (res.started) {
+        const names = mixed.slice(0, 5).map((u, i) => (i + 1) + '. ' + (state.names[u] || u)).join('\n');
+        let msg = 'In riproduzione: ' + mixed.length + ' brani in ordine casuale.\nPrimi 5 del mix:\n' + names;
+        if (res.shuffleOn) {
+          msg += '\n\nAttenzione: Spotify ha lo shuffle attivo e rimescola per conto suo, per questo senti i soliti brani. Spegni l’icona shuffle nel player di Spotify e premi di nuovo il pulsante.';
+        } else if (!res.firstOk && res.playing) {
+          msg += '\n\nAttenzione: Spotify sta suonando «' + res.playing + '», che non è il primo del mix. Di solito è colpa della coda di Spotify: svuotala e riprova.';
+        }
+        say(msg, !!(res.shuffleOn || (!res.firstOk && res.playing)));
       } else {
         sayLink('Playlist «' + TARGET_NAME + '» pronta con ' + mixed.length + ' brani. Non ho trovato un dispositivo attivo: apri Spotify, avvia un brano qualsiasi e premi di nuovo il pulsante, oppure apri la playlist da qui.', url, 'Apri in Spotify');
       }
@@ -563,6 +624,11 @@
     say(''); show('login');
   });
   $('filter').addEventListener('input', renderSources);
+  $('count').addEventListener('change', updateFreshUI);
+  $('fresh').checked = store.get('ts_fresh') === '1';
+  $('fresh').addEventListener('change', () => store.set('ts_fresh', $('fresh').checked ? '1' : '0'));
+  $('reset-hist').addEventListener('click', () => { store.del(HIST_KEY); updateFreshUI(); say('Cronologia azzerata.'); });
+  updateFreshUI();
   $('go').addEventListener('click', run);
 
   // ---------- Avvio ----------
